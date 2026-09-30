@@ -7,6 +7,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobRequest,
+    UserInputTranscribedEvent,
     cli,
 )
 from livekit.plugins import google
@@ -55,7 +56,6 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
     # Existing Samsung AI Kernel.
-    # We are not changing the Kernel itself.
     gemini_bridge = GeminiKernelBridge()
 
     kernel_tools = LiveKitKernelTools(
@@ -77,6 +77,30 @@ async def entrypoint(ctx: JobContext):
         tools=tools,
     )
 
+    # Diagnostic: show whether Gemini/LiveKit is
+    # actually producing a transcript from microphone audio.
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(
+        event: UserInputTranscribedEvent,
+    ):
+        print(
+            "[VOICE] Transcript:",
+            repr(event.transcript),
+            "| final=",
+            event.is_final,
+            "| language=",
+            event.language,
+        )
+
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(event):
+        print(
+            "[VOICE] Agent state:",
+            event.old_state,
+            "->",
+            event.new_state,
+        )
+
     await session.start(
         agent=SamsungAgent(),
         room=ctx.room,
@@ -88,9 +112,6 @@ async def entrypoint(ctx: JobContext):
         "[LIVEKIT] Available tools:",
         [tool.id for tool in tools],
     )
-
-    # Do not force an initial generate_reply().
-    # Gemini Live will respond to actual user microphone input.
     print("[LIVEKIT] Gemini Live is ready for microphone input.")
 
 
