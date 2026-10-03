@@ -14,6 +14,22 @@ from tools import (
     HotelSearchTool,
 )
 
+from extensions.doctor_appointment import (
+    DoctorAppointmentTool,
+)
+
+from extensions.kitchen_assistant import (
+    KitchenAssistantTool,
+)
+
+from extensions.study_helper import (
+    StudyHelperTool,
+)
+
+from extensions.employee_planner import (
+    EmployeePlannerTool,
+)
+
 from kernel_events import (
     EventStream,
     KernelEventType,
@@ -104,6 +120,26 @@ class Kernel:
             HotelSearchTool()
         )
 
+        self.register_tool(
+            DoctorAppointmentTool()
+        )
+
+        # --------------------------------------------------
+        # EXTENSION TOOLS
+        # --------------------------------------------------
+
+        self.register_tool(
+            KitchenAssistantTool()
+        )
+
+        self.register_tool(
+            StudyHelperTool()
+        )
+
+        self.register_tool(
+            EmployeePlannerTool()
+        )
+
     # ======================================================
     # EVENT EMISSION
     # ======================================================
@@ -158,21 +194,18 @@ class Kernel:
         task = Task(
             task_id=str(uuid.uuid4()),
             goal=goal,
-            status=TaskStatus.RUNNING
+            status=TaskStatus.RUNNING,
         )
 
         self.current_task = task
-
-        self.current_task_id = (
-            task.task_id
-        )
+        self.current_task_id = task.task_id
 
         self.emit_event(
             KernelEventType.TASK_STARTED,
-            task.task_id,
+            task_id=task.task_id,
             data={
                 "goal": goal
-            }
+            },
         )
 
         print(
@@ -186,328 +219,286 @@ class Kernel:
         return task
 
     # ======================================================
-    # EXECUTE ONE TOOL
+    # EXECUTE TOOL
     # ======================================================
 
     async def execute_tool(
         self,
         tool_name: str,
         task_id: str,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> ToolResult:
 
         # --------------------------------------------------
-        # TASK VALIDATION
+        # VALIDATE ACTIVE TASK
         # --------------------------------------------------
 
         if self.current_task is None:
-
             raise RuntimeError(
-                "No active task."
+                "No active Kernel task. "
+                "Start a task before executing a tool."
             )
 
-        if task_id != self.current_task.task_id:
-
+        if self.current_task_id != task_id:
             raise RuntimeError(
-                "Task ID does not match "
-                "the active task."
+                f"Task mismatch. "
+                f"Active task: {self.current_task_id}, "
+                f"requested task: {task_id}"
             )
 
-        if self.current_task.status in (
-            TaskStatus.CANCELLED,
-            TaskStatus.DONE,
-            TaskStatus.FAILED
-        ):
+        task = self.current_task
 
+        # --------------------------------------------------
+        # VALIDATE TASK STATUS
+        # --------------------------------------------------
+
+        if task.status != TaskStatus.RUNNING:
             raise RuntimeError(
-                "Task is no longer active."
+                f"Task {task_id} is not running. "
+                f"Current status: {task.status.value}"
             )
 
         # --------------------------------------------------
-        # TOOL VALIDATION
+        # VALIDATE TOOL
         # --------------------------------------------------
 
         if tool_name not in self.tools:
 
-            raise ValueError(
-                f"Unknown tool: {tool_name}"
+            result = ToolResult(
+                task_id=task_id,
+                tool_name=tool_name,
+                success=False,
+                error=(
+                    f"Unknown tool: {tool_name}"
+                ),
+                retryable=False,
             )
 
-        tool = self.tools[
-            tool_name
-        ]
+            task.results[tool_name] = result
 
-        max_attempts = self.max_retries
+            self.emit_event(
+                KernelEventType.TOOL_FAILED,
+                task_id=task_id,
+                tool_name=tool_name,
+                error=result.error,
+            )
+
+            return result
+
+        tool = self.tools[tool_name]
+
+        # --------------------------------------------------
+        # TOOL START
+        # --------------------------------------------------
+
+        self.emit_event(
+            KernelEventType.TOOL_STARTED,
+            task_id=task_id,
+            tool_name=tool_name,
+            data=kwargs,
+        )
+
+        print(
+            f"Executing tool: {tool_name}"
+        )
+
+        print(
+            f"Arguments: {kwargs}"
+        )
 
         # --------------------------------------------------
         # RETRY LOOP
         # --------------------------------------------------
 
+        last_result: ToolResult | None = None
+
         for attempt in range(
             1,
-            max_attempts + 1
+            self.max_retries + 1
         ):
 
-            # --------------------------------------------------
-            # CHECK CANCELLATION
-            # --------------------------------------------------
-
-            if (
-                self.current_task.status
-                == TaskStatus.CANCELLED
-            ):
-
-                raise asyncio.CancelledError
-
-            # --------------------------------------------------
-            # TOOL START EVENT
-            # --------------------------------------------------
-
-            self.emit_event(
-                KernelEventType.TOOL_STARTED,
-                task_id,
-                tool_name=tool_name,
-                data={
-                    "attempt": attempt
-                }
-            )
-
-            print(
-                f"Executing '{tool_name}' "
-                f"(attempt {attempt}/"
-                f"{max_attempts})"
-            )
-
-            # --------------------------------------------------
-            # RUN TOOL
-            # --------------------------------------------------
+            task.retry_count = attempt - 1
 
             try:
 
+                print(
+                    f"Attempt {attempt}: "
+                    f"{tool_name}"
+                )
+
                 result = await tool.run(
-                    task_id=task_id,
-                    **kwargs
-                )
-
-            except asyncio.CancelledError:
-
-                print(
-                    f"Execution of "
-                    f"'{tool_name}' "
-                    f"was cancelled."
-                )
-
-                raise
-
-            except Exception as error:
-
-                self.emit_event(
-                    KernelEventType.TOOL_FAILED,
                     task_id,
-                    tool_name=tool_name,
-                    data={
-                        "attempt": attempt
-                    },
-                    error=str(error)
+                    **kwargs,
                 )
 
-                print(
-                    f"'{tool_name}' "
-                    f"raised an exception: "
-                    f"{error}"
-                )
+                last_result = result
 
-                if attempt >= max_attempts:
+                # --------------------------------------------------
+                # SUCCESS
+                # --------------------------------------------------
 
-                    self.current_task.status = (
-                        TaskStatus.FAILED
+                if result.success:
+
+                    task.results[
+                        tool_name
+                    ] = result
+
+                    task.completed_steps.append(
+                        tool_name
                     )
 
                     self.emit_event(
-                        KernelEventType.TASK_FAILED,
-                        task_id,
+                        KernelEventType.TOOL_COMPLETED,
+                        task_id=task_id,
                         tool_name=tool_name,
-                        error=str(error)
+                        data=result.data,
                     )
 
-                    raise
+                    print(
+                        f"'{tool_name}' "
+                        f"succeeded on attempt {attempt}."
+                    )
 
-                self.current_task.retry_count += 1
+                    return result
 
-                await asyncio.sleep(
-                    0.2
-                )
+                # --------------------------------------------------
+                # NON-RETRYABLE FAILURE
+                # --------------------------------------------------
 
-                continue
+                if not result.retryable:
 
-            # --------------------------------------------------
-            # LATE / STALE RESULT PROTECTION
-            # --------------------------------------------------
+                    task.results[
+                        tool_name
+                    ] = result
 
-            if self.current_task is None:
+                    self.emit_event(
+                        KernelEventType.TOOL_FAILED,
+                        task_id=task_id,
+                        tool_name=tool_name,
+                        error=result.error,
+                    )
 
-                raise asyncio.CancelledError
+                    print(
+                        f"'{tool_name}' failed "
+                        f"on attempt {attempt}: "
+                        f"{result.error}"
+                    )
 
-            if (
-                self.current_task.task_id
-                != task_id
-            ):
+                    return result
 
-                raise RuntimeError(
-                    "Task ID does not match "
-                    "the active task."
-                )
-
-            if (
-                self.current_task.status
-                == TaskStatus.CANCELLED
-            ):
-
-                raise asyncio.CancelledError
-
-            # --------------------------------------------------
-            # SUCCESS
-            # --------------------------------------------------
-
-            if result.success:
-
-                self.current_task.results[
-                    tool_name
-                ] = result
-
-                self.emit_event(
-                    KernelEventType.TOOL_COMPLETED,
-                    task_id,
-                    tool_name=tool_name,
-                    data={
-                        "attempt": attempt,
-                        "result": result.data
-                    }
-                )
+                # --------------------------------------------------
+                # RETRYABLE FAILURE
+                # --------------------------------------------------
 
                 print(
-                    f"'{tool_name}' "
-                    f"succeeded on attempt "
-                    f"{attempt}."
+                    f"'{tool_name}' failed "
+                    f"on attempt {attempt}; "
+                    f"retrying..."
                 )
 
-                return result
+                if attempt < self.max_retries:
 
-            # --------------------------------------------------
-            # TOOL FAILURE
-            # --------------------------------------------------
+                    await asyncio.sleep(
+                        0.5 * attempt
+                    )
+
+            except Exception as exc:
+
+                error_message = str(exc)
+
+                print(
+                    f"Exception while executing "
+                    f"'{tool_name}': "
+                    f"{error_message}"
+                )
+
+                last_result = ToolResult(
+                    task_id=task_id,
+                    tool_name=tool_name,
+                    success=False,
+                    error=error_message,
+                    retryable=False,
+                )
+
+                task.results[
+                    tool_name
+                ] = last_result
+
+                self.emit_event(
+                    KernelEventType.TOOL_FAILED,
+                    task_id=task_id,
+                    tool_name=tool_name,
+                    error=error_message,
+                )
+
+                return last_result
+
+        # --------------------------------------------------
+        # RETRIES EXHAUSTED
+        # --------------------------------------------------
+
+        if last_result is not None:
+
+            task.results[
+                tool_name
+            ] = last_result
 
             self.emit_event(
                 KernelEventType.TOOL_FAILED,
-                task_id,
+                task_id=task_id,
                 tool_name=tool_name,
-                data={
-                    "attempt": attempt
-                },
-                error=result.error
+                error=last_result.error,
             )
 
-            # --------------------------------------------------
-            # RETRYABLE FAILURE
-            # --------------------------------------------------
+            return last_result
 
-            if (
-                result.retryable
-                and attempt < max_attempts
-            ):
-
-                self.current_task.retry_count += 1
-
-                print(
-                    f"'{tool_name}' "
-                    f"failed but is retryable."
-                )
-
-                await asyncio.sleep(
-                    0.2
-                )
-
-                continue
-
-            # --------------------------------------------------
-            # FINAL FAILURE
-            # --------------------------------------------------
-
-            self.current_task.results[
-                tool_name
-            ] = result
-
-            print(
-                f"'{tool_name}' "
-                f"failed permanently."
-            )
-
-            return result
-
-        raise RuntimeError(
-            "Unexpected tool execution state."
+        result = ToolResult(
+            task_id=task_id,
+            tool_name=tool_name,
+            success=False,
+            error=(
+                f"Tool '{tool_name}' failed "
+                f"without returning a result."
+            ),
+            retryable=False,
         )
 
+        task.results[
+            tool_name
+        ] = result
+
+        return result
+
     # ======================================================
-    # MULTIPLE TOOLS
+    # EXECUTE MULTIPLE TOOLS
     # ======================================================
 
     async def execute_multiple_tools(
         self,
         task_id: str,
-        tool_requests: list[
-            dict[str, Any]
-        ]
-    ) -> dict[
-        str,
-        ToolResult
-    ]:
+        tool_calls: list[dict[str, Any]],
+    ) -> list[ToolResult]:
 
-        print(
-            f"Executing "
-            f"{len(tool_requests)} "
-            f"tools..."
-        )
+        results: list[ToolResult] = []
 
-        tasks = []
+        for tool_call in tool_calls:
 
-        for request in tool_requests:
-
-            tool_name = request[
+            tool_name = tool_call[
                 "tool_name"
             ]
 
-            # Support both APIs.
-            kwargs = request.get(
-                "arguments"
+            arguments = tool_call.get(
+                "arguments",
+                {}
             )
 
-            if kwargs is None:
-
-                kwargs = request.get(
-                    "kwargs",
-                    {}
-                )
-
-            tasks.append(
-                self.execute_tool(
-                    tool_name,
-                    task_id,
-                    **kwargs
-                )
+            result = await self.execute_tool(
+                tool_name,
+                task_id,
+                **arguments,
             )
 
-        results_list = await asyncio.gather(
-            *tasks
-        )
-
-        results = {}
-
-        for result in results_list:
-
-            results[
-                result.tool_name
-            ] = result
+            results.append(result)
 
         return results
 
@@ -515,513 +506,357 @@ class Kernel:
     # CHECKPOINT
     # ======================================================
 
-    def save_checkpoint(
+    def checkpoint(
         self,
+        task_id: str,
         checkpoint: str,
-        step_name: str,
-        **data: Any
     ) -> None:
 
         if self.current_task is None:
-
             raise RuntimeError(
-                "No active task."
+                "No active Kernel task."
             )
 
-        self.current_task.current_step += 1
+        if self.current_task_id != task_id:
+            raise RuntimeError(
+                "Task mismatch."
+            )
 
-        self.current_task.checkpoint = (
-            checkpoint
-        )
-
-        self.current_task.slots.update(
-            data
-        )
-
-        self.current_task.completed_steps.append(
-            step_name
-        )
+        self.current_task.checkpoint = checkpoint
 
         self.emit_event(
-            KernelEventType.CHECKPOINT_SAVED,
-            self.current_task.task_id,
-            step_name=step_name,
+            KernelEventType.CHECKPOINT_CREATED,
+            task_id=task_id,
             checkpoint=checkpoint,
-            data=data
-        )
-
-        print()
-
-        print(
-            "Checkpoint saved:"
         )
 
         print(
-            f"Step: "
-            f"{self.current_task.current_step}"
-        )
-
-        print(
-            f"Name: "
-            f"{step_name}"
-        )
-
-        print(
-            f"Checkpoint: "
+            f"Checkpoint created: "
             f"{checkpoint}"
         )
-
-        if data:
-
-            print(
-                f"Stored data: {data}"
-            )
 
     # ======================================================
     # COMPLETE TASK
     # ======================================================
 
-    def complete_current_task(
-        self
-    ) -> None:
+    def complete_task(
+        self,
+        task_id: str,
+    ) -> Task:
 
         if self.current_task is None:
+            raise RuntimeError(
+                "No active Kernel task."
+            )
 
-            return
+        if self.current_task_id != task_id:
+            raise RuntimeError(
+                "Task mismatch."
+            )
 
-        if (
-            self.current_task.status
-            == TaskStatus.CANCELLED
-        ):
-
-            return
-
-        self.current_task.status = (
-            TaskStatus.DONE
-        )
-
-        self.current_task.checkpoint = (
-            "task_completed"
-        )
+        self.current_task.status = TaskStatus.DONE
 
         self.emit_event(
             KernelEventType.TASK_COMPLETED,
-            self.current_task.task_id
+            task_id=task_id,
         )
 
         print(
-            f"Task completed: "
-            f"{self.current_task.task_id}"
+            f"Task completed: {task_id}"
         )
+
+        return self.current_task
 
     # ======================================================
     # FAIL TASK
     # ======================================================
 
-    def fail_current_task(
-        self
-    ) -> None:
+    def fail_task(
+        self,
+        task_id: str,
+        error: str,
+    ) -> Task:
 
         if self.current_task is None:
+            raise RuntimeError(
+                "No active Kernel task."
+            )
 
-            return
+        if self.current_task_id != task_id:
+            raise RuntimeError(
+                "Task mismatch."
+            )
 
-        if (
-            self.current_task.status
-            == TaskStatus.CANCELLED
-        ):
-
-            return
-
-        self.current_task.status = (
-            TaskStatus.FAILED
-        )
+        self.current_task.status = TaskStatus.FAILED
 
         self.emit_event(
             KernelEventType.TASK_FAILED,
-            self.current_task.task_id
+            task_id=task_id,
+            error=error,
         )
 
         print(
             f"Task failed: "
-            f"{self.current_task.task_id}"
+            f"{task_id} | {error}"
         )
+
+        return self.current_task
 
     # ======================================================
     # CANCEL TASK
     # ======================================================
 
-    def cancel_current_task(
-        self
-    ) -> None:
+    def cancel_task(
+        self,
+        task_id: str,
+    ) -> Task:
 
         if self.current_task is None:
+            raise RuntimeError(
+                "No active Kernel task."
+            )
 
-            return
+        if self.current_task_id != task_id:
+            raise RuntimeError(
+                "Task mismatch."
+            )
 
-        if self.current_task.status in (
-            TaskStatus.DONE,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED
-        ):
-
-            return
-
-        task_id = self.current_task.task_id
-
-        self.current_task.status = (
-            TaskStatus.CANCELLED
-        )
-
-        self.current_task.checkpoint = (
-            "task_cancelled"
-        )
+        self.current_task.status = TaskStatus.CANCELLED
 
         self.emit_event(
             KernelEventType.TASK_CANCELLED,
-            task_id
+            task_id=task_id,
         )
 
         print(
-            f"Task cancelled: "
+            f"Task cancelled: {task_id}"
+        )
+
+        return self.current_task
+
+    # ======================================================
+    # CORRECTION
+    # ======================================================
+
+    def correct_task(
+        self,
+        task_id: str,
+        correction: str,
+    ) -> Task:
+
+        if self.current_task is None:
+            raise RuntimeError(
+                "No active Kernel task."
+            )
+
+        if self.current_task_id != task_id:
+            raise RuntimeError(
+                "Task mismatch."
+            )
+
+        self.current_task.goal = correction
+
+        self.current_task.status = TaskStatus.RUNNING
+
+        self.emit_event(
+            KernelEventType.TASK_CORRECTED,
+            task_id=task_id,
+            data={
+                "correction": correction
+            },
+        )
+
+        print(
+            f"Task corrected: "
             f"{task_id}"
         )
 
-        if (
-            self._current_async_task
-            and not self._current_async_task.done()
-        ):
-
-            self._current_async_task.cancel()
+        return self.current_task
 
     # ======================================================
-    # USER CORRECTION / INTERRUPTION
-    # ======================================================
-
-    def handle_user_correction(
-        self,
-        new_goal: str
-    ) -> Task:
-
-        old_task_id = None
-
-        if self.current_task:
-
-            old_task_id = (
-                self.current_task.task_id
-            )
-
-            self.cancel_current_task()
-
-        print()
-
-        print(
-            "Starting corrected task..."
-        )
-
-        new_task = self.start_task(
-            goal=new_goal
-        )
-
-        print(
-            f"Previous task: "
-            f"{old_task_id}"
-        )
-
-        print(
-            f"New task: "
-            f"{new_task.task_id}"
-        )
-
-        return new_task
-
-    # ======================================================
-    # TASK GETTERS
+    # GET CURRENT TASK
     # ======================================================
 
     def get_current_task(
-        self
+        self,
     ) -> Task | None:
 
         return self.current_task
 
-    def get_task_status(
-        self
-    ) -> TaskStatus | None:
+    # ======================================================
+    # GET TASK
+    # ======================================================
 
-        if self.current_task is None:
+    def get_task(
+        self,
+        task_id: str,
+    ) -> Task | None:
 
-            return None
+        if (
+            self.current_task is not None
+            and self.current_task.task_id == task_id
+        ):
+            return self.current_task
 
-        return self.current_task.status
+        return None
 
-    def get_registered_tools(
-        self
-    ) -> list[str]:
+    # ======================================================
+    # GET TOOL
+    # ======================================================
 
-        return list(
-            self.tools.keys()
+    def get_tool(
+        self,
+        tool_name: str,
+    ) -> BaseTool | None:
+
+        return self.tools.get(
+            tool_name
         )
 
     # ======================================================
-    # MULTI-STEP WORKFLOW TEST
+    # GET TOOLS
     # ======================================================
 
-    async def multi_step_workflow_test(
-        self
-    ) -> bool:
+    def get_tools(
+        self,
+    ) -> dict[str, BaseTool]:
 
-        print()
+        return self.tools
 
-        print(
-            "=" * 70
-        )
+    # ======================================================
+    # MULTI-STEP WORKFLOW
+    # ======================================================
 
-        print(
-            "          MULTI-STEP WORKFLOW TEST"
-        )
-
-        print(
-            "=" * 70
-        )
+    async def run_workflow(
+        self,
+        goal: str,
+        steps: list[dict[str, Any]],
+    ) -> Task:
 
         task = self.start_task(
-            goal=(
-                "Plan a trip from "
-                "Bengaluru to Delhi."
+            goal
+        )
+
+        try:
+
+            for index, step in enumerate(
+                steps,
+                start=1,
+            ):
+
+                task.current_step = index
+
+                tool_name = step[
+                    "tool_name"
+                ]
+
+                arguments = step.get(
+                    "arguments",
+                    {},
+                )
+
+                step_name = step.get(
+                    "step_name",
+                    f"Step {index}",
+                )
+
+                print(
+                    f"\nSTEP {index}: "
+                    f"{step_name}"
+                )
+
+                self.emit_event(
+                    KernelEventType.STEP_STARTED,
+                    task_id=task.task_id,
+                    tool_name=tool_name,
+                    step_name=step_name,
+                )
+
+                result = await self.execute_tool(
+                    tool_name,
+                    task.task_id,
+                    **arguments,
+                )
+
+                if not result.success:
+
+                    self.fail_task(
+                        task.task_id,
+                        result.error
+                        or "Tool execution failed.",
+                    )
+
+                    return task
+
+                self.emit_event(
+                    KernelEventType.STEP_COMPLETED,
+                    task_id=task.task_id,
+                    tool_name=tool_name,
+                    step_name=step_name,
+                    data=result.data,
+                )
+
+            self.complete_task(
+                task.task_id
             )
-        )
 
-        print()
+            return task
 
-        print(
-            "WORKFLOW:"
-        )
+        except Exception as exc:
 
-        print(
-            "Step 1 → Search flight"
-        )
+            self.fail_task(
+                task.task_id,
+                str(exc),
+            )
 
-        print(
-            "Step 2 → Search hotel"
-        )
-
-        print(
-            "Step 3 → Finalize"
-        )
-
-        # --------------------------------------------------
-        # STEP 1
-        # --------------------------------------------------
-
-        print()
-
-        print(
-            "STEP 1: Flight search"
-        )
-
-        flight_result = await self.execute_tool(
-            tool_name="flight_search",
-            task_id=task.task_id,
-            origin="Bengaluru",
-            destination="Delhi"
-        )
-
-        if not flight_result.success:
-
-            self.fail_current_task()
-
-            return False
-
-        self.save_checkpoint(
-            checkpoint="flight_search_completed",
-            step_name="flight_search",
-            flight=flight_result.data
-        )
-
-        # --------------------------------------------------
-        # STEP 2
-        # --------------------------------------------------
-
-        print()
-
-        print(
-            "STEP 2: Hotel search"
-        )
-
-        hotel_result = await self.execute_tool(
-            tool_name="hotel_search",
-            task_id=task.task_id,
-            city="Delhi"
-        )
-
-        if not hotel_result.success:
-
-            self.fail_current_task()
-
-            return False
-
-        self.save_checkpoint(
-            checkpoint="hotel_search_completed",
-            step_name="hotel_search",
-            hotel=hotel_result.data
-        )
-
-        # --------------------------------------------------
-        # STEP 3
-        # --------------------------------------------------
-
-        print()
-
-        print(
-            "STEP 3: Finalizing workflow"
-        )
-
-        self.save_checkpoint(
-            checkpoint="workflow_ready",
-            step_name="finalization"
-        )
-
-        self.complete_current_task()
-
-        # --------------------------------------------------
-        # VERIFY
-        # --------------------------------------------------
-
-        print()
-
-        print(
-            "Final task status:"
-        )
-
-        print(
-            task.status
-        )
-
-        print()
-
-        print(
-            "Current step:"
-        )
-
-        print(
-            task.current_step
-        )
-
-        print()
-
-        print(
-            "Checkpoint:"
-        )
-
-        print(
-            task.checkpoint
-        )
-
-        print()
-
-        print(
-            "Completed steps:"
-        )
-
-        print(
-            task.completed_steps
-        )
-
-        print()
-
-        print(
-            "Stored workflow data:"
-        )
-
-        print(
-            task.slots
-        )
-
-        if task.status != TaskStatus.DONE:
-
-            return False
-
-        if task.current_step != 3:
-
-            return False
-
-        if task.checkpoint != (
-            "task_completed"
-        ):
-
-            return False
-
-        if len(
-            task.completed_steps
-        ) != 3:
-
-            return False
-
-        if "flight" not in task.slots:
-
-            return False
-
-        if "hotel" not in task.slots:
-
-            return False
-
-        print()
-
-        print(
-            "MULTI-STEP WORKFLOW TEST PASSED"
-        )
-
-        return True
+            return task
 
 
 # ==========================================================
-# MAIN
+# DIRECT EXECUTION
 # ==========================================================
-
-async def main():
-
-    kernel = Kernel()
-
-    passed = await (
-        kernel.multi_step_workflow_test()
-    )
-
-    print()
-
-    print(
-        "=" * 70
-    )
-
-    if passed:
-
-        print(
-            "       KERNEL MULTI-STEP "
-            "WORKFLOW PASSED"
-        )
-
-    else:
-
-        print(
-            "       KERNEL MULTI-STEP "
-            "WORKFLOW FAILED"
-        )
-
-    print(
-        "=" * 70
-    )
-
 
 if __name__ == "__main__":
 
-    try:
+    async def main():
 
-        asyncio.run(main())
+        kernel = Kernel()
 
-    except KeyboardInterrupt:
+        # --------------------------------------------------
+        # Show all registered tools
+        # --------------------------------------------------
 
-        print()
+        print("\nRegistered tools:")
+
+        for tool_name in kernel.get_tools():
+            print(f"  - {tool_name}")
+
+        # --------------------------------------------------
+        # Basic smart-home test
+        # --------------------------------------------------
+
+        task = kernel.start_task(
+            "Test Samsung AI Kernel"
+        )
+
+        result = await kernel.execute_tool(
+            "smart_home",
+            task.task_id,
+            device="living_room_light",
+            action="turn_on",
+        )
 
         print(
-            "Program interrupted by user."
+            "\nTool result:"
         )
+
+        print(
+            result
+        )
+
+        kernel.complete_task(
+            task.task_id
+        )
+
+
+    asyncio.run(main())
